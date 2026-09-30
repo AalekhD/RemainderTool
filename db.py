@@ -251,6 +251,18 @@ def create_worker(
         return False, user_id, str(e)
 
 
+def reset_worker_password(username: str) -> str | None:
+    temporary_password = generate_temp_password(8)
+    password_hash = password_digest(temporary_password)
+    with connection() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET password_hash = ?, must_change_password = 1 "
+            "WHERE LOWER(username) = LOWER(?) AND role = 'Worker' AND is_active = 1",
+            (password_hash, username.strip()),
+        )
+        return temporary_password if cursor.rowcount else None
+
+
 def toggle_worker_status(username: str, is_active: bool) -> bool:
     with connection() as conn:
         cursor = conn.execute(
@@ -309,6 +321,47 @@ def update_task_status(task_id: int, status: str) -> bool:
             (status, now, task_id)
         )
         return cursor.rowcount > 0
+
+
+def reassign_task(task_id: int, new_worker_username: str) -> bool:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with connection() as conn:
+        worker = conn.execute(
+            "SELECT 1 FROM users WHERE LOWER(username) = LOWER(?) AND role = 'Worker' AND is_active = 1",
+            (new_worker_username.strip(),),
+        ).fetchone()
+        task = conn.execute(
+            "SELECT assigned_to_user_id, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not worker or not task:
+            return False
+        if task["status"] not in {"Assigned", "Accepted", "In Progress", "Submitted", "Rejected"}:
+            return False
+        if task["assigned_to_user_id"].lower() == new_worker_username.strip().lower():
+            return False
+        cursor = conn.execute(
+            "UPDATE tasks SET assigned_to_user_id = ?, status = 'Assigned', updated_at = ? WHERE id = ?",
+            (new_worker_username.strip(), now, task_id),
+        )
+        return cursor.rowcount > 0
+
+
+def delete_task(task_id: int) -> Tuple[bool, List[str]]:
+    with connection() as conn:
+        task = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            return False, []
+        proof_paths = [
+            row["proof_path"]
+            for row in conn.execute(
+                "SELECT proof_path FROM submissions WHERE task_id = ? AND proof_path != ''",
+                (task_id,),
+            ).fetchall()
+        ]
+        conn.execute("DELETE FROM submissions WHERE task_id = ?", (task_id,))
+        cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return cursor.rowcount > 0, proof_paths
 
 
 def list_tasks(

@@ -14,6 +14,7 @@ from db import (
     create_task,
     create_task_submission,
     create_worker,
+    delete_task,
     generate_temp_password,
     generate_unique_user_id,
     get_admin_dashboard_metrics,
@@ -25,6 +26,8 @@ from db import (
     init_db,
     list_tasks,
     list_workers,
+    reassign_task,
+    reset_worker_password,
     review_submission,
     toggle_worker_status,
     update_task_status,
@@ -753,6 +756,19 @@ def save_uploaded_proof(uploaded_file, submission_id: int) -> tuple[str, str]:
     return str(target), proof_type
 
 
+def remove_task_proof_files(proof_paths: list[str]) -> None:
+    upload_root = UPLOAD_DIR.resolve()
+    for stored_path in proof_paths:
+        proof_path = Path(stored_path)
+        try:
+            resolved_path = proof_path.resolve()
+            resolved_path.relative_to(upload_root)
+        except (OSError, ValueError):
+            continue
+        if resolved_path.is_file():
+            resolved_path.unlink(missing_ok=True)
+
+
 def render_status_badge(status: str) -> str:
     css_class = f"status-{status.lower().replace(' ', '-')}"
     icons = {
@@ -972,7 +988,7 @@ def render_admin_metrics() -> None:
             )
 
 
-def render_admin_task_card(task: dict, current_user: dict) -> None:
+def render_admin_task_card(task: dict, current_user: dict, active_workers: list[dict]) -> None:
     is_overdue = check_is_overdue(task["due_datetime"], task["status"])
     overdue_badge = '<span class="overdue-pill">OVERDUE</span>' if is_overdue else ""
 
@@ -991,22 +1007,73 @@ def render_admin_task_card(task: dict, current_user: dict) -> None:
                 unsafe_allow_html=True,
             )
         with action_badge_col:
-            tg_msg = create_task_assignment_message(
-                task_uid=task["task_uid"],
-                title=task["title"],
-                priority=task["priority"],
-                due_datetime=task["due_datetime"],
-                proof_requirements=task["proof_requirements"],
-                description=task["description"],
-            )
-            tg_share_url = get_telegram_share_url(tg_msg, username=task.get("assignee_telegram", ""))
-            st.markdown(
-                f'<a href="{tg_share_url}" target="_blank" class="telegram-btn" style="width: 100%; font-size: 0.78rem; padding: 0.4rem 0.6rem;">✈️ Telegram Share</a>',
-                unsafe_allow_html=True,
-            )
+            worker_chat_id = str(task.get("assignee_telegram") or "").strip()
+            if st.button(
+                "Send Reminder",
+                key=f"task-reminder-{task['id']}",
+                use_container_width=True,
+                disabled=not worker_chat_id.isdigit() or task["status"] == "Approved",
+            ):
+                reminder_message = (
+                    f"TaskTrack reminder for task {task['task_uid']}\n"
+                    f"Due: {task['due_datetime']}\n"
+                    "Please sign in to TaskTrack Pro to review your task."
+                )
+                sent, detail = send_telegram_bot_message(worker_chat_id, reminder_message)
+                if sent:
+                    st.success(f"Reminder sent to {task['assignee_name']}.")
+                else:
+                    st.error(f"Telegram reminder failed: {detail}")
 
         st.markdown(f"**Instructions / Description:** {task['description'] or '*(No description provided)*'}")
         st.markdown(f"**Required Proof:** `{task['proof_requirements']}`")
+
+        task_action_col, delete_action_col = st.columns([1, 1])
+        with task_action_col:
+            if task["status"] != "Approved":
+                with st.expander("Reassign task"):
+                    available_workers = [
+                        worker for worker in active_workers
+                        if worker["username"].lower() != task["assigned_to_user_id"].lower()
+                    ]
+                    if not available_workers:
+                        st.info("No other active workers are available.")
+                    else:
+                        with st.form(f"reassign-task-{task['id']}"):
+                            new_assignee = st.selectbox(
+                                "Assign to worker",
+                                available_workers,
+                                format_func=lambda worker: f"{worker['full_name']} ({worker['username']})",
+                            )
+                            if st.form_submit_button("Reassign and reset to Assigned"):
+                                if reassign_task(task["id"], new_assignee["username"]):
+                                    st.success("Task reassigned. Existing submission history is retained.")
+                                    st.rerun()
+                                else:
+                                    st.error("Task could not be reassigned.")
+
+        with delete_action_col:
+            if st.button("Delete task", key=f"delete-task-{task['id']}", use_container_width=True):
+                st.session_state["pending_delete_task"] = task["id"]
+                st.rerun()
+
+            if st.session_state.get("pending_delete_task") == task["id"]:
+                st.warning("Permanently delete this task, its submissions, and uploaded proof files?")
+                confirm_col, cancel_col = st.columns(2)
+                with confirm_col:
+                    if st.button("Confirm delete", key=f"confirm-delete-{task['id']}", type="primary"):
+                        deleted, proof_paths = delete_task(task["id"])
+                        if deleted:
+                            remove_task_proof_files(proof_paths)
+                            st.session_state.pop("pending_delete_task", None)
+                            st.success("Task and submission history permanently deleted.")
+                            st.rerun()
+                        else:
+                            st.error("Task could not be deleted.")
+                with cancel_col:
+                    if st.button("Cancel", key=f"cancel-delete-{task['id']}"):
+                        st.session_state.pop("pending_delete_task", None)
+                        st.rerun()
 
         # Submissions & Proof Inspection
         submissions = get_submissions_for_task(task["id"])
@@ -1018,6 +1085,8 @@ def render_admin_task_card(task: dict, current_user: dict) -> None:
             p_col1, p_col2 = st.columns([1.6, 1.4])
             with p_col1:
                 st.markdown(f"**Submitted by:** {latest_sub['submitted_by']} on `{latest_sub['submitted_at']}`")
+                if latest_sub["submitted_by"].lower() != task["assigned_to_user_id"].lower():
+                    st.caption("Historical submission from a previous assignee; retained for the task record.")
                 if latest_sub["notes"]:
                     st.info(f"**Worker Completion Notes:**\n\n{latest_sub['notes']}")
 
@@ -1043,7 +1112,11 @@ def render_admin_task_card(task: dict, current_user: dict) -> None:
 
             with p_col2:
                 st.markdown("##### Decision & Review Actions")
-                if latest_sub["status"] == "Submitted" or task["status"] == "Submitted":
+                if (
+                    task["status"] == "Submitted"
+                    and latest_sub["status"] == "Submitted"
+                    and latest_sub["submitted_by"].lower() == task["assigned_to_user_id"].lower()
+                ):
                     review_feedback = st.text_area(
                         "Feedback / Comments (Optional for Approval, Required for Rejection)",
                         key=f"feedback-{task['id']}",
@@ -1141,6 +1214,8 @@ def render_admin_task_card(task: dict, current_user: dict) -> None:
                         """,
                         unsafe_allow_html=True,
                     )
+                else:
+                    st.caption("Submission history is retained; no review is pending.")
         else:
             st.caption("No proof submitted yet for this task.")
 
@@ -1159,42 +1234,84 @@ def admin_dashboard_view(current_user: dict) -> None:
 
     render_admin_metrics()
     st.write("")
+    workers = list_workers(include_disabled=True)
+    all_tasks = list_tasks()
+    tasks_by_worker: dict[str, list[dict]] = {}
+    for task in all_tasks:
+        tasks_by_worker.setdefault(task["assigned_to_user_id"].lower(), []).append(task)
 
-    # Filters row
-    f_col1, f_col2, f_col3, f_col4 = st.columns([2, 1.2, 1.2, 1.5])
-    with f_col1:
-        search = st.text_input("🔍 Search tasks or ID", placeholder="Search title, description, or task ID...")
-    with f_col2:
-        status_filter = st.selectbox(
-            "Status Filter",
-            ["All", "Submitted", "Assigned", "Accepted", STATUS_IN_PROGRESS, "Approved", "Rejected"],
-            index=0,
-        )
-    with f_col3:
-        priority_filter = st.selectbox("Priority Filter", ["All", "Urgent", "High", "Medium", "Low"], index=0)
-    with f_col4:
-        workers = list_workers(include_disabled=True)
-        worker_options = ["All Workers"] + [f"{w['full_name']} ({w['username']})" for w in workers]
-        selected_worker_raw = st.selectbox("Assignee Filter", worker_options, index=0)
-
-    assigned_to_filter = None
-    if selected_worker_raw != "All Workers":
-        assigned_to_filter = selected_worker_raw.split("(")[-1].replace(")", "").strip()
-
-    tasks = list_tasks(
-        assigned_to=assigned_to_filter,
-        status_filter=status_filter if status_filter != "All" else None,
-        priority_filter=priority_filter if priority_filter != "All" else None,
-        search_query=search if search else None,
+    selected_username = st.session_state.get("operations_selected_worker")
+    selected_worker = next(
+        (worker for worker in workers if worker["username"].lower() == (selected_username or "").lower()),
+        None,
     )
+    if selected_username and not selected_worker:
+        st.session_state.pop("operations_selected_worker", None)
 
-    st.write("")
-    if not tasks:
-        st.info("No tasks match the selected filter criteria.")
+    if not selected_worker:
+        st.subheader("Workers")
+        if not workers:
+            st.info("No workers have been created yet.")
+            return
+
+        worker_columns = st.columns(2)
+        for index, worker in enumerate(workers):
+            worker_tasks = tasks_by_worker.get(worker["username"].lower(), [])
+            awaiting_review = sum(task["status"] == "Submitted" for task in worker_tasks)
+            in_progress = sum(task["status"] in {"Accepted", STATUS_IN_PROGRESS} for task in worker_tasks)
+            with worker_columns[index % 2]:
+                with st.container(border=True):
+                    if st.button(
+                        f"{worker['full_name']}  ·  {worker['username']}",
+                        key=f"open-worker-{worker['id']}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["operations_selected_worker"] = worker["username"]
+                        st.rerun()
+                    st.caption(
+                        f"{len(worker_tasks)} tasks  ·  {in_progress} in progress  ·  "
+                        f"{awaiting_review} awaiting review"
+                    )
         return
 
-    for task in tasks:
-        render_admin_task_card(task, current_user)
+    if st.button("← All workers", key="operations-back-to-workers"):
+        st.session_state.pop("operations_selected_worker", None)
+        st.rerun()
+
+    st.subheader(f"{selected_worker['full_name']} · Tasks")
+    worker_tasks = tasks_by_worker.get(selected_worker["username"].lower(), [])
+    status_counts = {
+        status: sum(task["status"] == status for task in worker_tasks)
+        for status in ["Assigned", "Accepted", STATUS_IN_PROGRESS, "Submitted", "Approved", "Rejected"]
+    }
+    count_columns = st.columns(4)
+    count_items = [
+        ("Assigned", status_counts["Assigned"]),
+        ("In Progress", status_counts["Accepted"] + status_counts[STATUS_IN_PROGRESS]),
+        ("Awaiting Review", status_counts["Submitted"]),
+        ("Approved", status_counts["Approved"]),
+    ]
+    for column, (label, value) in zip(count_columns, count_items):
+        with column:
+            st.metric(label, value)
+
+    status_filter = st.selectbox(
+        "Filter by status",
+        ["All", "Assigned", "Accepted", STATUS_IN_PROGRESS, "Submitted", "Approved", "Rejected"],
+        key=f"worker-task-status-{selected_worker['id']}",
+    )
+    filtered_tasks = [
+        task for task in worker_tasks
+        if status_filter == "All" or task["status"] == status_filter
+    ]
+
+    if not filtered_tasks:
+        st.info("This worker has no tasks matching the selected status.")
+        return
+
+    active_workers = list_workers(include_disabled=False)
+    for task in filtered_tasks:
+        render_admin_task_card(task, current_user, active_workers)
 
 
 def admin_assign_task_view(current_user: dict) -> None:
@@ -1469,6 +1586,33 @@ def admin_worker_management_view() -> None:
 
                         if not worker_chat_id.isdigit():
                             st.caption("Add a numeric Telegram chat ID to enable bot messages.")
+
+                        if st.button(
+                            "Reset & Send Credentials",
+                            key=f"reset-send-credentials-{w['id']}",
+                            use_container_width=True,
+                            disabled=not worker_chat_id.isdigit() or not w["is_active"],
+                        ):
+                            temporary_password = reset_worker_password(w["username"])
+                            if not temporary_password:
+                                st.error("Could not reset credentials for this worker.")
+                            else:
+                                credentials_message = create_worker_welcome_message(
+                                    full_name=w["full_name"],
+                                    user_id=w["username"],
+                                    temp_password=temporary_password,
+                                    portal_url=os.getenv("TASKTRACK_PORTAL_URL", DEFAULT_APP_PORTAL_URL),
+                                )
+                                sent, detail = send_telegram_bot_message(
+                                    worker_chat_id,
+                                    credentials_message,
+                                )
+                                if sent:
+                                    st.success(f"New temporary credentials sent to {w['full_name']}.")
+                                else:
+                                    st.error(f"Telegram delivery failed: {detail}")
+                                    st.warning("The worker password was reset; share this temporary login securely:")
+                                    st.code(f"User ID: {w['username']}\nTemporary password: {temporary_password}")
 
                         if w["is_active"]:
                             if st.button("Disable Access", key=f"disable-{w['id']}", use_container_width=True):
